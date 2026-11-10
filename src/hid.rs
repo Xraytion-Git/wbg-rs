@@ -191,7 +191,7 @@ fn open_raw(path: &str, rw: bool) -> Result<HANDLE, io::Error> {
     Ok(h)
 }
 
-fn caps_of(h: HANDLE) -> Option<(HIDP_CAPS, u16)> {
+fn caps_of(h: HANDLE) -> Option<(HIDP_CAPS, u16, u16)> {
     let fns = hid_fns()?;
     unsafe {
         let mut attrs = HIDD_ATTRIBUTES {
@@ -225,7 +225,7 @@ fn caps_of(h: HANDLE) -> Option<(HIDP_CAPS, u16)> {
         if ok != 0x00110000 {
             return None;
         }
-        Some((caps, attrs.product_id))
+        Some((caps, attrs.vendor_id, attrs.product_id))
     }
 }
 
@@ -241,6 +241,8 @@ pub struct Candidate {
     pub feature_len: u16,
     #[allow(dead_code)]
     pub product_id: u16,
+    #[allow(dead_code)]
+    pub vendor_id: u16,
 }
 
 /// Portable HID enumeration via SetupDiGetClassDevs + HID class GUID.
@@ -298,11 +300,11 @@ pub fn enumerate(page: u16, usage: u16) -> Vec<Candidate> {
 
             // Log every HID device found
             if let Ok(h) = open_raw(&path, false) {
-                if let Some((caps, pid)) = caps_of(h) {
-                    let match_ = caps.usage_page == page && caps.usage == usage;
+                if let Some((caps, vid, pid)) = caps_of(h) {
+                    let match_ = caps.usage_page == page && caps.usage == usage && vid == 0x31e3;
                     crate::log(&format!(
-                        "hid[{}]: page=0x{:04x} usage={} pid=0x{:04x} in={} feat={} {} path={}",
-                        idx, caps.usage_page, caps.usage, pid,
+                        "hid[{}]: vid=0x{:04x} pid=0x{:04x} page=0x{:04x} usage={} in={} feat={} {} path={}",
+                        idx, vid, pid, caps.usage_page, caps.usage,
                         caps.input_report_byte_length, caps.feature_report_byte_length,
                         if match_ { "MATCH" } else { "" },
                         &path[..path.len().min(80)]
@@ -315,6 +317,7 @@ pub fn enumerate(page: u16, usage: u16) -> Vec<Candidate> {
                             input_len: caps.input_report_byte_length,
                             feature_len: caps.feature_report_byte_length,
                             product_id: pid,
+                            vendor_id: vid,
                         });
                     }
                 } else {
@@ -366,7 +369,7 @@ impl Dev {
     pub fn open_path(path: &str) -> Result<Self, io::Error> {
         let h = open_raw(path, true)?;
         let caps = match caps_of(h) {
-            Some((caps, _)) => caps,
+            Some((caps, _vid, _pid)) => caps,
             None => {
                 unsafe { CloseHandle(h) };
                 return Err(io::Error::new(io::ErrorKind::Other, "HID caps unavailable"));
