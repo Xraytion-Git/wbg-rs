@@ -348,6 +348,35 @@ impl Dev {
         })
     }
 
+    /// Reopen by known device path without re-enumeration (fast reconnect).
+    /// Used when a handle dies but the device is still present — avoids the
+    /// full registry scan + caps probe that `enumerate()` + `open()` require.
+    pub fn open_path(path: &str) -> Result<Self, io::Error> {
+        let h = open_raw(path, true)?;
+        let caps = match caps_of(h) {
+            Some((caps, _)) => caps,
+            None => {
+                unsafe { CloseHandle(h) };
+                return Err(io::Error::new(io::ErrorKind::Other, "HID caps unavailable"));
+            }
+        };
+        let ev = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null_mut()) };
+        let ov = OVERLAPPED {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            h_event: ev,
+        };
+        Ok(Self {
+            path: path.to_string(),
+            h,
+            ov,
+            input_len: caps.input_report_byte_length.max(8) as usize,
+            feature_len: caps.feature_report_byte_length.max(8) as usize,
+        })
+    }
+
     pub fn set_feature(&self, frame8: &[u8; 8]) -> Result<(), io::Error> {
         let fns = hid_fns().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "hid.dll unavailable"))?;
         let mut buf = vec![0u8; self.feature_len];

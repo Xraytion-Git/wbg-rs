@@ -2,8 +2,16 @@
 //! The stock service dies when the anti-cheat resets the keyboard's USB
 //! (hid_read error 0x48F "device not connected") and waits passively for the
 //! device to reappear, so app-linked profile switching is dead for the whole
-//! game session. Here: shared open + 1s reconnect + re-plan/re-apply pending
-//! transitions on reconnect (LinkState keeps the return profile).
+//! game session. Here: shared open + fast handle reconnect + re-plan/re-apply
+//! pending transitions on reconnect (LinkState keeps the return profile).
+//!
+//! Performance design (vs the 750 ms poll-loop original):
+//! - Foreground polled at 80 ms with cached process path (re-query only on
+//!   HWND/PID change) — switching detection latency 0-80 ms instead of 0-750 ms.
+//! - Device I/O only when the desired profile actually changes (or after
+//!   reconnect) — no per-tick firmware reads.
+//! - Handle-level reconnect: reopen by known path in ~1 ms, preserve Rules +
+//!   LinkState. Full re-enumeration only when fast reconnect fails.
 
 #![windows_subsystem = "windows"]
 
@@ -18,6 +26,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::OnceLock;
 use std::sync::mpsc::{Sender, channel};
+use std::time::{Duration, Instant};
 
 use ff55::*;
 use link::LinkState;
@@ -80,11 +89,11 @@ fn query(dev: &mut hid::Dev, command: u8, param: u32) -> Result<Vec<u8>, String>
     dev.drain();
     dev.set_feature(&command_frame(command, param))
         .map_err(|e| format!("send 0x{command:02x}: {e}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    let deadline = Instant::now() + Duration::from_millis(1500);
     let mut last = "no matching response".to_string();
     let mut buf = vec![0u8; 4096];
     loop {
-        let remain = deadline.saturating_duration_since(std::time::Instant::now());
+        let remain = deadline.saturating_duration_since(Instant::now());
         if remain.is_zero() {
             return Err(format!("cmd 0x{command:02x} timeout: {last}"));
         }
@@ -180,10 +189,31 @@ fn activate(dev: &mut hid::Dev, id: ProfileId) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Session: one live device handle + its rules and link state.
+// ---------------------------------------------------------------------------
+
 struct Session {
     dev: hid::Dev,
     rules: matchers::Rules,
     state: LinkState,
+}
+
+impl Session {
+    /// Fast handle reconnect: reopen by known path, verify with a probe read.
+    /// Preserves `rules` and `state` across the handle swap — no re-enumeration,
+    /// no profile re-read.  Returns the device's actual current profile so the
+    /// caller can re-sync.
+    fn reconnect(&mut self) -> Result<ProfileId, String> {
+        let path = self.dev.path.clone();
+        let mut fresh = hid::Dev::open_path(&path)
+            .map_err(|e| format!("reopen {}: {e}", path))?;
+        let current = current_profile(&mut fresh)
+            .map_err(|e| format!("probe after reopen: {e}"))?;
+        self.dev = fresh; // old handle dropped (closed) here
+        log(&format!("handle reconnected {path}, current={current:?}"));
+        Ok(current)
+    }
 }
 
 fn try_open() -> Result<Session, String> {
@@ -240,73 +270,124 @@ fn try_open() -> Result<Session, String> {
     Err("no usable control interface".into())
 }
 
+fn execute_transition(dev: &mut hid::Dev, t: &link::Transition) -> Result<(), String> {
+    let mut op = Ok(());
+    if let Some(sel) = t.selection {
+        op = select_linked(dev, sel);
+    }
+    if op.is_ok() {
+        if let Some(a) = t.activate {
+            op = activate(dev, a);
+        }
+    }
+    op
+}
+
+// ---------------------------------------------------------------------------
+// Main event loop
+// ---------------------------------------------------------------------------
+
 fn main() {
     spawn_logger();
     log(&format!("wbg-rs start pid={}", std::process::id()));
     std::thread::spawn(api::serve);
+
+    let mut tracker = win32::ForegroundTracker::new();
     let mut session: Option<Session> = None;
-    let mut last_desired: Option<ProfileId> = None;
-    let mut tick: u64 = 0;
+    // LinkState survives across full reconnects so that a pending target and
+    // the user's baseline are never lost when the device has to be re-opened.
+    let mut saved_link: Option<LinkState> = None;
+    let mut desired: Option<ProfileId> = None;
+    let mut needs_sync = true;
+    let mut last_hb = Instant::now();
+    let mut backoff = Duration::from_millis(100);
+
     loop {
+        // === Ensure device session ===
         if session.is_none() {
             match try_open() {
-                Ok(s) => {
-                    let had_pending = last_desired.is_some();
-                    session = Some(s);
-                    if had_pending {
-                        log("reconnected with pending target - will re-apply");
+                Ok(mut s) => {
+                    if let Some(prev) = saved_link.take() {
+                        s.state = prev;
                     }
+                    session = Some(s);
+                    needs_sync = true;
+                    backoff = Duration::from_millis(100);
                 }
                 Err(e) => {
                     log(&format!("waiting for device: {e}"));
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
                 }
             }
         }
-        if let Some(s) = session.as_mut() {
-            let fg = win32::foreground();
-            let desired = fg.as_ref().and_then(|f| s.rules.desired(f));
-            tick += 1;
-            if desired != last_desired || tick % 20 == 0 {
-                log(&format!(
-                    "hb fg={} desired={:?} ({})",
-                    fg.as_ref().map(|f| f.exe_name.as_str()).unwrap_or("?"),
-                    desired,
-                    desired
-                        .map(|d| s.rules.profile_name(d))
-                        .unwrap_or_default()
-                ));
-                last_desired = desired;
-            }
+
+        // === Foreground detection (cheap; process path is cached) ===
+        let fg = tracker.poll();
+        let new_desired = session
+            .as_ref()
+            .and_then(|s| fg.as_ref().and_then(|f| s.rules.desired(f)));
+
+        // === Switch profiles when the desired target changes (or on resync) ===
+        let mut needs_drop = false;
+        if new_desired != desired || needs_sync {
+            desired = new_desired;
+            needs_sync = false;
+            let s = session.as_mut().unwrap();
             match current_profile(&mut s.dev) {
                 Ok(current) => {
                     if let Some(t) = s.state.plan(current, desired) {
-                        let mut op = Ok(());
-                        if let Some(sel) = t.selection {
-                            op = select_linked(&mut s.dev, sel);
-                        }
-                        if op.is_ok() {
-                            if let Some(a) = t.activate {
-                                op = activate(&mut s.dev, a);
-                            }
-                        }
-                        match op {
+                        match execute_transition(&mut s.dev, &t) {
                             Ok(()) => {
                                 s.state = t.next;
-                                log(&format!("transition applied desired={desired:?}"));
+                                log("transition applied");
                             }
                             Err(e) => {
-                                log(&format!("transition FAILED ({e}) - dropping device, will retry"));
-                                session = None;
+                                log(&format!("transition failed ({e}), reconnecting"));
+                                match s.reconnect() {
+                                    Ok(_) => needs_sync = true,
+                                    Err(e2) => {
+                                        log(&format!("fast reconnect failed: {e2}"));
+                                        needs_drop = true;
+                                    }
+                                }
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    log(&format!("device lost: {e}"));
-                    session = None;
+                    log(&format!("device lost ({e}), reconnecting"));
+                    match s.reconnect() {
+                        Ok(_) => needs_sync = true,
+                        Err(e2) => {
+                            log(&format!("fast reconnect failed: {e2}"));
+                            needs_drop = true;
+                        }
+                    }
                 }
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(750));
+
+        // === Drop session (preserving LinkState) when fast reconnect failed ===
+        if needs_drop {
+            if let Some(s) = session.as_ref() {
+                saved_link = Some(s.state.clone());
+            }
+            session = None;
+            needs_sync = true;
+        }
+
+        // === Heartbeat ===
+        if last_hb.elapsed() > Duration::from_secs(30) {
+            last_hb = Instant::now();
+            let fg_name = fg.as_ref().map(|f| f.exe_name.as_str()).unwrap_or("?");
+            let d_name = desired
+                .and_then(|d| session.as_ref().map(|s| s.rules.profile_name(d)))
+                .unwrap_or_default();
+            log(&format!("hb fg={fg_name} desired={d_name}"));
+        }
+
+        std::thread::sleep(Duration::from_millis(80));
     }
 }
