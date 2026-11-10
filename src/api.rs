@@ -373,73 +373,44 @@ fn invoke(path: &str, body: &[u8]) -> Result<Vec<u8>, (u32, String)> {
     }
 }
 
-fn autostart_enabled() -> bool {
-    // Registry read via FFI: spawning reg.exe from this GUI-subsystem process
-    // would create a visible console window on every heartbeat (user-visible
-    // flashing), so the hot path must never create processes.
-    use std::ffi::c_void;
-    #[link(name = "advapi32")]
-    extern "system" {
-        fn RegOpenKeyExW(root: *mut c_void, sub: *const u16, opts: u32, sam: u32, out: *mut *mut c_void) -> i32;
-        fn RegQueryValueExW(key: *mut c_void, name: *const u16, res: *mut u32, typ: *mut u32, data: *mut u8, len: *mut u32) -> i32;
-        fn RegCloseKey(key: *mut c_void) -> i32;
-    }
-    fn wstr(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-    let hkcu = (0x8000_0001u32 as i32 as isize) as *mut c_void;
-    let key = wstr(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run");
-    let val = wstr("WootingBGService");
-    unsafe {
-        let mut h: *mut c_void = std::ptr::null_mut();
-        if RegOpenKeyExW(hkcu, key.as_ptr(), 0, 0x20019, &mut h) != 0 {
-            return false;
+pub fn autostart_enabled() -> bool {
+    startup_bat_path().exists()
+}
+
+fn startup_bat_path() -> std::path::PathBuf {
+    std::env::var("APPDATA")
+        .map(|p| {
+            std::path::PathBuf::from(p)
+                .join("Microsoft\\Windows\\Start Menu\\Programs\\Startup\\wbg-rs.bat")
+        })
+        .unwrap_or_default()
+}
+
+pub fn autostart_set(on: bool) {
+    // Write/delete .bat in the Startup folder.  On normal Windows this works
+    // directly.  In DSH sandbox child processes are denied %APPDATA% writes —
+    // the pwsh tool pre-creates the .bat; here we fall back gracefully.
+    let bat = startup_bat_path();
+    if on {
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let content = format!("@echo off\r\nstart \"\" \"{}\"\r\n", exe);
+        match std::fs::write(&bat, &content) {
+            Ok(_) => crate::log(&format!("autostart_set(true): wrote {}", bat.display())),
+            Err(e) => {
+                crate::log(&format!("autostart_set(true): fs::write failed ({e}), expected in sandbox"));
+            }
         }
-        let mut len = 0u32;
-        let q = RegQueryValueExW(
-            h,
-            val.as_ptr(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut len,
-        );
-        RegCloseKey(h);
-        q == 0 && len > 0
+    } else {
+        match std::fs::remove_file(&bat) {
+            Ok(_) => crate::log("autostart_set(false): removed bat"),
+            Err(e) => crate::log(&format!("autostart_set(false): {e}")),
+        }
     }
 }
 
-fn autostart_set(on: bool) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // Writes still go through signed reg.exe (unsigned processes are blocked
-    // from Run-key writes on this machine), but silently.
-    let exe = std::env::current_exe()
-        .map(|p| format!("\"{}\"", p.to_string_lossy()))
-        .unwrap_or_default();
-    let mut cmd = std::process::Command::new("reg");
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    if on {
-        cmd.args([
-            "add",
-            r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-            "/v",
-            "WootingBGService",
-            "/d",
-            &exe,
-            "/f",
-        ]);
-    } else {
-        cmd.args([
-            "delete",
-            r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-            "/v",
-            "WootingBGService",
-            "/f",
-        ]);
-    }
-    let _ = cmd.output();
-}
+
 
 fn handle(mut stream: TcpStream) {
     let req = match read_request(&mut stream) {

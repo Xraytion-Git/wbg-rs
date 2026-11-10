@@ -20,6 +20,7 @@ mod ff55;
 mod hid;
 mod link;
 mod matchers;
+mod tray;
 mod win32;
 
 use std::fs::OpenOptions;
@@ -35,7 +36,7 @@ use link::LinkState;
 // switching loop (this box has intermittent multi-second I/O stalls).
 static LOGTX: OnceLock<Sender<String>> = OnceLock::new();
 
-fn log(msg: &str) {
+pub fn log(msg: &str) {
     if let Some(tx) = LOGTX.get() {
         let _ = tx.send(format!("{} {}", civil_ts(), msg));
     }
@@ -291,6 +292,13 @@ fn main() {
     spawn_logger();
     log(&format!("wbg-rs start pid={}", std::process::id()));
     std::thread::spawn(api::serve);
+    std::thread::spawn(tray::start_tray);
+
+    // Default autostart: enable on first run (or if user hasn't disabled it).
+    if !api::autostart_enabled() {
+        api::autostart_set(true);
+        log("autostart enabled (default)");
+    }
 
     let mut tracker = win32::ForegroundTracker::new();
     let fg_rx = win32::start_foreground_watcher();
