@@ -299,6 +299,8 @@ fn main() {
     let mut saved_link: Option<LinkState> = None;
     let mut desired: Option<ProfileId> = None;
     let mut needs_sync = true;
+    let mut fg_none_since: Option<Instant> = None;
+    let mut return_desired: Option<ProfileId> = None;
     let mut last_hb = Instant::now();
     let mut backoff = Duration::from_millis(100);
 
@@ -325,16 +327,49 @@ fn main() {
 
         // === Foreground detection (cheap; process path is cached) ===
         let fg = tracker.poll();
-        let new_desired = session
+        let raw_desired = session
             .as_ref()
             .and_then(|s| fg.as_ref().and_then(|f| s.rules.desired(f)));
 
+        // When GetForegroundWindow returns null (brief flicker during window
+        // switches), keep the previous desired instead of dropping to baseline.
+        let new_desired = match (&fg, &raw_desired) {
+            (None, _) => desired, // transient null foreground — keep current
+            (Some(_), _) => raw_desired,
+        };
+
+        // Debounce only transient fg=None flickers; switch immediately when
+        // a real non-linked window is in the foreground.
+        if raw_desired.is_some() {
+            fg_none_since = None;
+            return_desired = raw_desired;
+        } else if desired.is_some() {
+            if fg.is_none() {
+                // Transient null foreground during window switch — debounce 300 ms.
+                if fg_none_since.is_none() {
+                    fg_none_since = Some(Instant::now());
+                }
+                if fg_none_since.unwrap().elapsed() < Duration::from_millis(300) {
+                    return_desired = desired;
+                } else {
+                    return_desired = None;
+                }
+            } else {
+                // Real non-linked window in foreground — return to baseline now.
+                fg_none_since = None;
+                return_desired = None;
+            }
+        } else {
+            fg_none_since = None;
+            return_desired = None;
+        }
+
         // === Diagnostic: log when desired changes or on every heartbeat ===
-        if new_desired != desired {
+        if return_desired != desired {
             log(&format!(
                 "desired changed: {:?} -> {:?}  fg={:?}",
                 desired,
-                new_desired,
+                return_desired,
                 fg.as_ref().map(|f| format!(
                     "exe={} path={} dir={} title={}",
                     f.exe_name, f.exe_path, f.dir, f.title
@@ -344,8 +379,8 @@ fn main() {
 
         // === Switch profiles when the desired target changes (or on resync) ===
         let mut needs_drop = false;
-        if new_desired != desired || needs_sync {
-            desired = new_desired;
+        if return_desired != desired || needs_sync {
+            desired = return_desired;
             needs_sync = false;
             let s = session.as_mut().unwrap();
             match current_profile(&mut s.dev) {
