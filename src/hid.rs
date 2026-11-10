@@ -123,6 +123,16 @@ struct SP_DEVICE_INTERFACE_DETAIL_DATA_W {
 const DIGCF_PRESENT: u32 = 0x02;
 const DIGCF_DEVICEINTERFACE: u32 = 0x10;
 
+// Registry FFI for device enumeration
+const HKLM: usize = 0x80000002;
+const KEY_READ: u32 = 0x20019;
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegOpenKeyExW(root: HANDLE, key: *const u16, opt: u32, access: u32, out: *mut HANDLE) -> i32;
+    fn RegEnumKeyExW(key: HANDLE, idx: u32, name: *mut u16, len: *mut u32, reserved: *mut u32, class: *mut u16, class_len: *mut u32, ft: *mut u8) -> i32;
+    fn RegCloseKey(key: HANDLE) -> i32;
+}
+
 // hid.dll dynamic loading
 type FnGetAttributes = unsafe extern "system" fn(HANDLE, *mut HIDD_ATTRIBUTES) -> i32;
 type FnGetPreparsed = unsafe extern "system" fn(HANDLE, *mut *mut c_void) -> i32;
@@ -245,10 +255,84 @@ pub struct Candidate {
     pub vendor_id: u16,
 }
 
-/// Portable HID enumeration via SetupDiGetClassDevs + HID class GUID.
-/// Works on all Windows machines (unlike registry scanning which is
-/// machine-specific).  Logs ALL found HID devices for diagnostics.
+/// HID enumeration: registry scan (primary, works on this machine) +
+/// SetupDiGetClassDevs (fallback for other machines).
+/// Both are run and results merged.
 pub fn enumerate(page: u16, usage: u16) -> Vec<Candidate> {
+    let mut out = enumerate_registry(page, usage);
+    let setupdi = enumerate_setupdi(page, usage);
+    for c in setupdi {
+        if !out.iter().any(|e| e.path == c.path) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Registry-based enumeration (original method, works on this machine).
+fn enumerate_registry(page: u16, usage: u16) -> Vec<Candidate> {
+    let mut paths: Vec<String> = Vec::new();
+    let classes = wstr(r"SYSTEM\CurrentControlSet\Control\DeviceClasses");
+    let mut root: HANDLE = std::ptr::null_mut();
+    if unsafe { RegOpenKeyExW(HKLM as HANDLE, classes.as_ptr(), 0, KEY_READ, &mut root) } != 0 {
+        return Vec::new();
+    }
+    let mut gidx = 0u32;
+    loop {
+        let mut gname = [0u16; 256];
+        let mut gnlen = gname.len() as u32;
+        let rc = unsafe {
+            RegEnumKeyExW(root, gidx, gname.as_mut_ptr(), &mut gnlen, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        if rc != 0 { break; }
+        gidx += 1;
+        let mut cls: HANDLE = std::ptr::null_mut();
+        if unsafe { RegOpenKeyExW(root, gname.as_ptr(), 0, KEY_READ, &mut cls) } != 0 { continue; }
+        let mut iidx = 0u32;
+        loop {
+            let mut name = [0u16; 512];
+            let mut nlen = name.len() as u32;
+            let rc = unsafe {
+                RegEnumKeyExW(cls, iidx, name.as_mut_ptr(), &mut nlen, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+            };
+            if rc != 0 { break; }
+            iidx += 1;
+            let sub = String::from_utf16_lossy(&name[..nlen as usize]);
+            let low = sub.to_ascii_lowercase();
+            if low.starts_with("##?#hid#") && low.contains("vid_31e3") {
+                let path = format!(r"\\?\{}", &sub[4..]);
+                if !paths.contains(&path) { paths.push(path); }
+            }
+        }
+        unsafe { RegCloseKey(cls) };
+    }
+    unsafe { RegCloseKey(root) };
+
+    let mut out = Vec::new();
+    for path in paths {
+        if let Ok(h) = open_raw(&path, false) {
+            if let Some((caps, vid, pid)) = caps_of(h) {
+                if caps.usage_page == page && caps.usage == usage && vid == 0x31e3 {
+                    out.push(Candidate {
+                        path,
+                        usage_page: caps.usage_page,
+                        usage: caps.usage,
+                        input_len: caps.input_report_byte_length,
+                        feature_len: caps.feature_report_byte_length,
+                        product_id: pid,
+                        vendor_id: vid,
+                    });
+                }
+            }
+            unsafe { CloseHandle(h) };
+        }
+    }
+    crate::log(&format!("hid: registry scan found {}", out.len()));
+    out
+}
+
+/// SetupDi-based enumeration (portable fallback for other machines).
+fn enumerate_setupdi(page: u16, usage: u16) -> Vec<Candidate> {
     let mut out = Vec::new();
     let mut all_count = 0u32;
     unsafe {
