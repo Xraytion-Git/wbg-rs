@@ -91,46 +91,6 @@ pub fn process_path(pid: u32) -> (String, String) {
     }
 }
 
-pub fn foreground() -> Option<Foreground> {
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_null() {
-            return None;
-        }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        let mut title = [0u16; 512];
-        let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
-        let title = String::from_utf16_lossy(&title[..n.max(0) as usize]);
-
-        let mut path = String::new();
-        let proc = OpenProcess(0x1000, 0, pid); // PROCESS_QUERY_LIMITED_INFORMATION
-        if !proc.is_null() {
-            let mut buf = [0u16; 512];
-            let mut len = buf.len() as u32;
-            if QueryFullProcessImageNameW(proc, 0, buf.as_mut_ptr(), &mut len) != 0 {
-                path = String::from_utf16_lossy(&buf[..len as usize]);
-            }
-            CloseHandle(proc);
-        }
-        let exe_name = path
-            .rsplit('\\')
-            .next()
-            .unwrap_or("")
-            .to_string();
-        let dir = path
-            .rsplit_once('\\')
-            .map(|(d, _)| d.to_string())
-            .unwrap_or_default();
-        Some(Foreground {
-            exe_path: path,
-            exe_name,
-            dir,
-            title,
-        })
-    }
-}
-
 /// Cached foreground-window tracker: avoids re-querying the process path on
 /// every poll (OpenProcess + QueryFullProcessImageName are the expensive part;
 /// GetForegroundWindow + GetWindowTextW are cheap).  Process path is re-queried
@@ -201,4 +161,92 @@ impl ForegroundTracker {
             })
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Event-driven foreground watcher (SetWinEventHook)
+// ---------------------------------------------------------------------------
+
+type HWINEVENTHOOK = *mut c_void;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct POINT {
+    x: i32,
+    y: i32,
+}
+
+#[repr(C)]
+struct MSG {
+    hwnd: HWND,
+    message: u32,
+    w_param: usize,
+    l_param: isize,
+    time: u32,
+    pt: POINT,
+}
+
+const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+
+#[link(name = "user32")]
+extern "system" {
+    fn SetWinEventHook(
+        event_min: u32,
+        event_max: u32,
+        hmod: *mut c_void,
+        proc_: Option<unsafe extern "system" fn(HWINEVENTHOOK, u32, HWND, i32, i32, u32, u32)>,
+        id_process: u32,
+        id_thread: u32,
+        flags: u32,
+    ) -> HWINEVENTHOOK;
+    fn UnhookWinEvent(h: HWINEVENTHOOK) -> i32;
+    fn GetMessageW(msg: *mut MSG, hwnd: HWND, min: u32, max: u32) -> i32;
+    fn TranslateMessage(msg: *const MSG) -> i32;
+    fn DispatchMessageW(msg: *const MSG) -> isize;
+}
+
+static FG_TX: std::sync::OnceLock<std::sync::mpsc::Sender<()>> = std::sync::OnceLock::new();
+
+unsafe extern "system" fn win_event_proc(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    _obj: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if let Some(tx) = FG_TX.get() {
+        let _ = tx.send(());
+    }
+}
+
+/// Start an event-driven foreground watcher.  Returns a Receiver<()> that
+/// yields one message per EVENT_SYSTEM_FOREGROUND.  Zero CPU when idle — the
+/// message-pump thread blocks in GetMessageW until Windows signals a change.
+pub fn start_foreground_watcher() -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let _ = FG_TX.set(tx);
+    std::thread::spawn(move || unsafe {
+        let hook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            std::ptr::null_mut(),
+            Some(win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        if hook.is_null() {
+            return;
+        }
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        UnhookWinEvent(hook);
+    });
+    rx
 }

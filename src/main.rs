@@ -293,6 +293,7 @@ fn main() {
     std::thread::spawn(api::serve);
 
     let mut tracker = win32::ForegroundTracker::new();
+    let fg_rx = win32::start_foreground_watcher();
     let mut session: Option<Session> = None;
     // LinkState survives across full reconnects so that a pending target and
     // the user's baseline are never lost when the device has to be re-opened.
@@ -300,6 +301,7 @@ fn main() {
     let mut desired: Option<ProfileId> = None;
     let mut needs_sync = true;
     let mut fg_none_since: Option<Instant> = None;
+    #[allow(unused_assignments)] // initial None is always overwritten before first read
     let mut return_desired: Option<ProfileId> = None;
     let mut last_hb = Instant::now();
     let mut backoff = Duration::from_millis(100);
@@ -325,18 +327,15 @@ fn main() {
             }
         }
 
-        // === Foreground detection (cheap; process path is cached) ===
+        // === Foreground detection: event-driven (SetWinEventHook) ===
+        // Block until Windows signals a foreground change, or timeout for heartbeat.
+        let _ = fg_rx.recv_timeout(Duration::from_secs(5));
+        // Drain any burst of rapid changes — only the latest matters.
+        while fg_rx.try_recv().is_ok() {}
         let fg = tracker.poll();
         let raw_desired = session
             .as_ref()
             .and_then(|s| fg.as_ref().and_then(|f| s.rules.desired(f)));
-
-        // When GetForegroundWindow returns null (brief flicker during window
-        // switches), keep the previous desired instead of dropping to baseline.
-        let new_desired = match (&fg, &raw_desired) {
-            (None, _) => desired, // transient null foreground — keep current
-            (Some(_), _) => raw_desired,
-        };
 
         // Debounce only transient fg=None flickers; switch immediately when
         // a real non-linked window is in the foreground.
@@ -345,17 +344,17 @@ fn main() {
             return_desired = raw_desired;
         } else if desired.is_some() {
             if fg.is_none() {
-                // Transient null foreground during window switch — debounce 300 ms.
+                // Transient null foreground during window switch — debounce 50 ms.
                 if fg_none_since.is_none() {
                     fg_none_since = Some(Instant::now());
                 }
-                if fg_none_since.unwrap().elapsed() < Duration::from_millis(50) {
-                    return_desired = desired;
+                return_desired = if fg_none_since.unwrap().elapsed() < Duration::from_millis(50) {
+                    desired
                 } else {
-                    return_desired = None;
-                }
+                    None
+                };
             } else {
-                // Real non-linked window in foreground — return to baseline now.
+                // Real non-linked window — return to baseline immediately.
                 fg_none_since = None;
                 return_desired = None;
             }
@@ -443,6 +442,6 @@ fn main() {
             log(&format!("hb fg={fg_detail} desired={d_name}({desired:?}) {st}"));
         }
 
-        std::thread::sleep(Duration::from_millis(80));
+        // No sleep needed — the loop blocks on fg_rx.recv_timeout() above.
     }
 }

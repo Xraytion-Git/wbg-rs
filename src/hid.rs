@@ -15,6 +15,7 @@ pub const FILE_FLAG_OVERLAPPED: u32 = 0x40000000;
 pub const INVALID_HANDLE: isize = -1;
 pub const WAIT_OBJECT_0: u32 = 0;
 pub const WAIT_TIMEOUT: u32 = 0x102;
+#[allow(dead_code)]
 pub const INFINITE: u32 = 0xffffffff;
 
 pub type HANDLE = *mut c_void;
@@ -76,7 +77,6 @@ extern "system" {
         read: *mut u32,
         ov: *mut OVERLAPPED,
     ) -> i32;
-    fn WriteFile(h: HANDLE, buf: *const u8, len: u32, written: *mut u32, ov: *mut OVERLAPPED) -> i32;
     fn CloseHandle(h: HANDLE) -> i32;
     fn GetLastError() -> u32;
     fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32;
@@ -145,14 +145,6 @@ extern "system" {
         cls_len: *mut u32,
         ft: *mut u8,
     ) -> i32;
-    fn RegQueryValueExW(
-        key: HANDLE,
-        name: *const u16,
-        res: *mut u32,
-        typ: *mut u32,
-        data: *mut u8,
-        len: *mut u32,
-    ) -> i32;
     fn RegCloseKey(key: HANDLE) -> i32;
 }
 
@@ -171,10 +163,13 @@ fn last_error() -> io::Error {
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub path: String,
+    #[allow(dead_code)]
     pub usage_page: u16,
+    #[allow(dead_code)]
     pub usage: u16,
     pub input_len: u16,
     pub feature_len: u16,
+    #[allow(dead_code)]
     pub product_id: u16,
 }
 

@@ -6,8 +6,11 @@
 //! Input IN:   [id(1..6)?, 0xD1, 0xDA, cmd_echo(0|cmd), status, body_len u16 LE, body]
 //! status 0x88 = ok, 0x66 = unsupported.
 
+#[allow(dead_code)]
 pub const VENDOR: u16 = 0x31e3;
+#[allow(dead_code)]
 pub const CONTROL_PAGE: u16 = 0xff55;
+#[allow(dead_code)]
 pub const CONTROL_USAGE: u16 = 1;
 
 pub const CMD_CURRENT: u8 = 0x0b;
