@@ -349,7 +349,7 @@ fn main() {
                 if fg_none_since.is_none() {
                     fg_none_since = Some(Instant::now());
                 }
-                if fg_none_since.unwrap().elapsed() < Duration::from_millis(300) {
+                if fg_none_since.unwrap().elapsed() < Duration::from_millis(50) {
                     return_desired = desired;
                 } else {
                     return_desired = None;
