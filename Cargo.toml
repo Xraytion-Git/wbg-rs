@@ -3,6 +3,10 @@ name = "wbg-rs"
 version = "1.0.0"
 edition = "2021"
 
+[[bin]]
+name = "WootingTool"
+path = "src/main.rs"
+
 [dependencies]
 serde_json = "1"
 
