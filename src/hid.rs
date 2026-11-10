@@ -245,9 +245,10 @@ pub struct Candidate {
 
 /// Portable HID enumeration via SetupDiGetClassDevs + HID class GUID.
 /// Works on all Windows machines (unlike registry scanning which is
-/// machine-specific).
+/// machine-specific).  Logs ALL found HID devices for diagnostics.
 pub fn enumerate(page: u16, usage: u16) -> Vec<Candidate> {
     let mut out = Vec::new();
+    let mut all_count = 0u32;
     unsafe {
         let set = SetupDiGetClassDevsW(
             HID_CLASS_GUID.as_ptr() as *const c_void,
@@ -256,6 +257,7 @@ pub fn enumerate(page: u16, usage: u16) -> Vec<Candidate> {
             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
         );
         if set as isize == -1 {
+            crate::log("hid: SetupDiGetClassDevsW failed");
             return out;
         }
 
@@ -272,14 +274,12 @@ pub fn enumerate(page: u16, usage: u16) -> Vec<Candidate> {
             }
             idx += 1;
 
-            // Get required size for detail
             let mut required = 0u32;
             SetupDiGetDeviceInterfaceDetailW(set, &mut iface, std::ptr::null_mut(), 0, &mut required, std::ptr::null_mut());
             if required == 0 {
                 continue;
             }
 
-            // Allocate detail buffer
             let mut detail_buf = vec![0u8; required as usize];
             let detail = detail_buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
             (*detail).cb_size = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
@@ -288,18 +288,26 @@ pub fn enumerate(page: u16, usage: u16) -> Vec<Candidate> {
                 continue;
             }
 
-            // Extract device path (UTF-16 string after the header)
             let path_start = &(*detail).device_path as *const u16;
             let mut len = 0;
             while *path_start.add(len) != 0 {
                 len += 1;
             }
             let path = String::from_utf16_lossy(std::slice::from_raw_parts(path_start, len));
+            all_count += 1;
 
-            // Open device and check caps
+            // Log every HID device found
             if let Ok(h) = open_raw(&path, false) {
                 if let Some((caps, pid)) = caps_of(h) {
-                    if caps.usage_page == page && caps.usage == usage {
+                    let match_ = caps.usage_page == page && caps.usage == usage;
+                    crate::log(&format!(
+                        "hid[{}]: page=0x{:04x} usage={} pid=0x{:04x} in={} feat={} {} path={}",
+                        idx, caps.usage_page, caps.usage, pid,
+                        caps.input_report_byte_length, caps.feature_report_byte_length,
+                        if match_ { "MATCH" } else { "" },
+                        &path[..path.len().min(80)]
+                    ));
+                    if match_ {
                         out.push(Candidate {
                             path,
                             usage_page: caps.usage_page,
@@ -309,12 +317,17 @@ pub fn enumerate(page: u16, usage: u16) -> Vec<Candidate> {
                             product_id: pid,
                         });
                     }
+                } else {
+                    crate::log(&format!("hid[{}]: open OK but caps failed path={}", idx, &path[..path.len().min(60)]));
                 }
                 CloseHandle(h);
+            } else {
+                crate::log(&format!("hid[{}]: open FAILED path={}", idx, &path[..path.len().min(60)]));
             }
         }
         SetupDiDestroyDeviceInfoList(set);
     }
+    crate::log(&format!("hid: enumerate done — {} HID interfaces total, {} matched", all_count, out.len()));
     out
 }
 
