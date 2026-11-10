@@ -329,6 +329,19 @@ fn main() {
             .as_ref()
             .and_then(|s| fg.as_ref().and_then(|f| s.rules.desired(f)));
 
+        // === Diagnostic: log when desired changes or on every heartbeat ===
+        if new_desired != desired {
+            log(&format!(
+                "desired changed: {:?} -> {:?}  fg={:?}",
+                desired,
+                new_desired,
+                fg.as_ref().map(|f| format!(
+                    "exe={} path={} dir={} title={}",
+                    f.exe_name, f.exe_path, f.dir, f.title
+                ))
+            ));
+        }
+
         // === Switch profiles when the desired target changes (or on resync) ===
         let mut needs_drop = false;
         if new_desired != desired || needs_sync {
@@ -379,13 +392,20 @@ fn main() {
         }
 
         // === Heartbeat ===
-        if last_hb.elapsed() > Duration::from_secs(30) {
+        if last_hb.elapsed() > Duration::from_secs(5) {
             last_hb = Instant::now();
-            let fg_name = fg.as_ref().map(|f| f.exe_name.as_str()).unwrap_or("?");
+            let fg_detail = fg.as_ref().map(|f| format!(
+                "exe={} path={} dir={} title={}",
+                f.exe_name, f.exe_path, f.dir, f.title
+            )).unwrap_or("None".into());
             let d_name = desired
                 .and_then(|d| session.as_ref().map(|s| s.rules.profile_name(d)))
                 .unwrap_or_default();
-            log(&format!("hb fg={fg_name} desired={d_name}"));
+            let st = session.as_ref().map(|s| format!(
+                "target={:?} baseline={:?}",
+                s.state.target, s.state.baseline
+            )).unwrap_or("no session".into());
+            log(&format!("hb fg={fg_detail} desired={d_name}({desired:?}) {st}"));
         }
 
         std::thread::sleep(Duration::from_millis(80));

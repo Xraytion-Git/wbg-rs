@@ -18,10 +18,11 @@ fn ci_contains(hay: &str, needle: &str) -> bool {
 }
 
 /// Directory match: exact or path-boundary prefix ("D:\Games" never matches
-/// "D:\Games2").
+/// "D:\Games2").  Normalises both slash styles so filters written with `/`
+/// (e.g. by Wootility or manual editing) match Windows `\` paths.
 fn dir_matches(dir: &str, value: &str) -> bool {
-    let d = dir.trim_end_matches('\\').to_ascii_lowercase();
-    let v = value.trim_end_matches('\\').to_ascii_lowercase();
+    let d = dir.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
+    let v = value.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
     d == v || d.starts_with(&format!("{v}\\"))
 }
 
@@ -73,18 +74,21 @@ impl Rules {
                     || ci_eq(&fg.exe_name, f.value.trim_end_matches(".exe"))
             }
             "process_directory" => {
-                if f.value.to_ascii_lowercase().ends_with(".exe") {
-                    ci_eq(&fg.exe_path, &f.value)
-                        || f
-                            .value
+                let v = f.value.replace('/', "\\");
+                if v.to_ascii_lowercase().ends_with(".exe") {
+                    ci_eq(&fg.exe_path, &v)
+                        || v
                             .rsplit_once('\\')
                             .map(|(d, _)| dir_matches(&fg.dir, d))
                             .unwrap_or(false)
                 } else {
-                    dir_matches(&fg.dir, &f.value)
+                    dir_matches(&fg.dir, &v)
                 }
             }
-            "process_full_path" => ci_eq(&fg.exe_path, &f.value),
+            "process_full_path" => {
+                ci_eq(&fg.exe_path, &f.value)
+                    || ci_eq(&fg.exe_path, &f.value.replace('/', "\\"))
+            }
             "window_title" => ci_contains(&fg.title, &f.value),
             _ => false,
         })
