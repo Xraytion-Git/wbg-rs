@@ -1,3 +1,8 @@
 target/
+target2/
 *.log
 wbg-rs-*.exe
+icon.res
+icon_rsrc.S
+wooting_img.bin
+wooting.rc
